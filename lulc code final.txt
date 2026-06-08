@@ -1,0 +1,177 @@
+# Install required libraries
+!pip install pillow matplotlib scikit-learn pandas scipy -q
+
+# Imports
+import numpy as np
+from PIL import Image
+import glob
+import re
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from sklearn.cluster import KMeans
+import pandas as pd
+import scipy.ndimage as ndi
+
+# Load all images
+files = sorted(glob.glob("hl*.jpg"), key=lambda x: int(re.findall(r'\d+', x)[0]))
+print(f"Loading {len(files)} files...")
+
+# === STEP 1: Find maximum dimensions across all images (unbiased) ===
+max_height = 0
+max_width = 0
+for file in files:
+    img = Image.open(file)
+    h, w = img.size[1], img.size[0]
+    max_height = max(max_height, h)
+    max_width = max(max_width, w)
+
+target_shape = (max_height, max_width)
+print(f"Target size (unbiased): {target_shape} pixels")
+
+# Auto-detect colors from first image
+sample_img = Image.open(files[0])
+sample_arr = np.array(sample_img)
+pixels = sample_arr.reshape(-1, 3)
+unique_colors = np.unique(pixels, axis=0)
+
+# Auto-create legend mapping
+legend_mapping = {}
+for color in unique_colors:
+    r, g, b = color
+    if r < 30 and g < 30 and b < 30:
+        legend_mapping[tuple(color)] = 0  # Background
+    elif b > 200 and r < 100 and g < 150:
+        legend_mapping[tuple(color)] = 1  # Water
+    elif r > 200 and g < 100 and b < 100:
+        legend_mapping[tuple(color)] = 2  # BuiltUp (Red)
+    elif g > 200 and r < 150 and b < 150:
+        legend_mapping[tuple(color)] = 3  # Vegetation (Green)
+    elif r > 200 and g > 200 and b < 100:
+        legend_mapping[tuple(color)] = 4  # BareLand (Yellow)
+    else:
+        legend_mapping[tuple(color)] = 0  # Default to background
+
+# === STEP 2: Load and resize ALL images to target_shape ===
+lulc_stack = []
+for file in files:
+    img = Image.open(file)
+
+    # Resize ALL images to the common target size
+    if img.size[::-1] != target_shape:
+        img = img.resize((target_shape[1], target_shape[0]), resample=Image.NEAREST)
+        print(f"Resized {file} to {target_shape}")
+
+    arr = np.array(img)
+
+    # Convert RGB to class indices
+    arr_class = np.zeros(arr.shape[:2], dtype=np.uint8)
+    for rgb, class_val in legend_mapping.items():
+        mask = np.all(arr == rgb, axis=-1)
+        arr_class[mask] = class_val
+
+    # === FIX: Reclassify internal black pixels (holes) as Water ===
+    background_mask = (arr_class == 0)
+
+    # Label all connected background regions
+    labeled_bg, num_features = ndi.label(background_mask)
+
+    # Identify black pixels connected to image border (true background)
+    border_labels = np.unique(np.concatenate([
+        labeled_bg[0, :], labeled_bg[-1, :],
+        labeled_bg[:, 0], labeled_bg[:, -1]
+    ]))
+
+    # True background = black connected to border
+    true_bg_mask = np.isin(labeled_bg, border_labels)
+
+    # Internal holes = black NOT connected to border → set as Water
+    holes_mask = background_mask & (~true_bg_mask)
+    arr_class[holes_mask] = 1  # Reclassify holes as Water
+
+    print(f"  Loaded {file}: filled {holes_mask.sum()} internal water pixels")
+
+    lulc_stack.append(arr_class)
+
+lulc_stack = np.stack(lulc_stack, axis=0)
+years = [int(re.findall(r'\d+', f)[0]) for f in files]
+print(f"\nStacked array shape: {lulc_stack.shape}")
+
+# === STEP 3: Calculate changes (only for island pixels) ===
+changes = np.sum([lulc_stack[i] != lulc_stack[i+1] for i in range(len(lulc_stack)-1)], axis=0)
+
+# Create island mask (pixels that are non-background in ANY year)
+island_mask = np.any(lulc_stack != 0, axis=0)
+
+# Mask out background areas from change map
+changes_masked = np.where(island_mask, changes, np.nan)
+
+# Calculate area statistics
+class_labels = [1, 2, 3, 4]
+class_names = ["Water", "BuiltUp", "Vegetation", "BareLand"]
+area_trends = {cl: [(lulc_stack[i]==cl).sum() for i in range(len(lulc_stack))] for cl in class_labels}
+
+# === CUSTOM COLORMAP: Match input image colors ===
+# Class 0=Background(black), 1=Water(blue), 2=BuiltUp(red), 3=Vegetation(green), 4=BareLand(yellow)
+custom_colors = ['black', 'blue', 'red', 'green', 'yellow']
+custom_cmap = ListedColormap(custom_colors)
+
+# OUTPUT 1: Statistical Table
+df_area = pd.DataFrame(area_trends, index=years)
+df_area.columns = class_names
+print("\n" + "="*60)
+print("OUTPUT 1: STATISTICAL TABLE (Pixel Count per Class per Year)")
+print("="*60)
+print(df_area)
+print("\n")
+
+# OUTPUT 2: Change Hotspot Map (with background masked)
+plt.figure(figsize=(10, 8))
+plt.imshow(changes_masked, cmap='hot', interpolation='nearest')
+plt.title("OUTPUT 2: LULC Change Hotspots (2014-2023)\nLothian & Henry Island", fontsize=16, weight='bold')
+plt.colorbar(label='Number of Transitions', shrink=0.8)
+plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+# OUTPUT 3: Line Graph of Area Trends (with matching colors)
+plt.figure(figsize=(12, 6))
+colors_line = ['blue', 'red', 'green', 'yellow']
+for cl, label, color in zip(class_labels, class_names, colors_line):
+    plt.plot(years, area_trends[cl], marker='o', label=label, linewidth=2.5, markersize=8, color=color)
+plt.xlabel("Year", fontsize=14, weight='bold')
+plt.ylabel("Pixel Count", fontsize=14, weight='bold')
+plt.title("OUTPUT 3: LULC Area Trends Over 10 Years (2014-2023)", fontsize=16, weight='bold')
+plt.legend(fontsize=12, loc='best')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# OUTPUT 4: Side-by-Side First vs Last Year (with correct colors)
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+im0 = axes[0].imshow(lulc_stack[0], cmap=custom_cmap, vmin=0, vmax=4, interpolation='nearest')
+axes[0].set_title(f'Year {years[0]}', fontsize=16, weight='bold')
+axes[0].axis('off')
+im1 = axes[1].imshow(lulc_stack[-1], cmap=custom_cmap, vmin=0, vmax=4, interpolation='nearest')
+axes[1].set_title(f'Year {years[-1]}', fontsize=16, weight='bold')
+axes[1].axis('off')
+fig.suptitle("OUTPUT 4: First vs Last Year LULC Comparison", fontsize=18, weight='bold', y=0.98)
+plt.tight_layout()
+plt.show()
+
+# OUTPUT 5: Trajectory Cluster Map
+pixel_vecs = lulc_stack.reshape(len(lulc_stack), -1).T
+kmeans = KMeans(n_clusters=6, random_state=42, n_init=10)
+trajectory_labels = kmeans.fit_predict(pixel_vecs)
+
+plt.figure(figsize=(10, 8))
+plt.imshow(trajectory_labels.reshape(lulc_stack.shape[1], lulc_stack.shape[2]),
+           cmap='tab10', interpolation='nearest')
+plt.title("OUTPUT 5: Pixel Trajectory Clusters\n(Multi-Year LULC Change Patterns)", fontsize=16, weight='bold')
+plt.colorbar(label='Trajectory Cluster ID', shrink=0.8)
+plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+print("\n" + "="*60)
+print("ALL 5 OUTPUTS GENERATED SUCCESSFULLY!")
+print("="*60)
